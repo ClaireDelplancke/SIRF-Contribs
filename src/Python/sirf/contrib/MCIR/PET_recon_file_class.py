@@ -29,9 +29,9 @@ Options:
   -I <str>, --initial=<str>         Initial estimate
   --visualisations                  show visualisations
   --nifti                           save output as nifti
-  --gpu                             use GPU projector
-  --niftypet                        use NiftyPET GPU projector, needs to be used together with --gpu
-  --parallelproj                    use Parallelproj GPU projector, needs to be used together with --gpu
+  --gpu                             use GPU for regulariser
+  --niftypet                        use NiftyPET GPU projector
+  --parallelproj                    use Parallelproj GPU projector
   -v <int>, --verbosity=<int>       STIR verbosity [default: 0]
   -s <int>, --save_interval=<int>   save every x iterations [default: 10]
   --descriptive_fname               option to have descriptive filenames
@@ -90,15 +90,17 @@ from sirf.Utilities import error, show_2D_array, examples_data_path
 import sirf.Reg as reg
 import sirf.STIR as pet
 from cil.framework import BlockDataContainer, ImageGeometry, BlockGeometry
-from cil.optimisation.algorithms import PDHG, SPDHG
+from cil.optimisation.algorithms import PDHG, SPDHG, FISTA
 from cil.optimisation.functions import \
-    KullbackLeibler, BlockFunction, IndicatorBox, MixedL21Norm, ScaledFunction
+    KullbackLeibler, BlockFunction, IndicatorBox, MixedL21Norm, ScaledFunction,\
+        SmoothKullbackLeibler, OperatorCompositionFunction
 from cil.optimisation.operators import \
     CompositionOperator, BlockOperator, LinearOperator, GradientOperator, ScaledOperator
 from cil.plugins.ccpi_regularisation.functions import FGP_TV
 from ccpi.filters import regularisers
 from cil.utilities.multiprocessing import NUM_THREADS
 import cProfile
+import functools
 
 __version__ = '0.1.0'
 
@@ -241,7 +243,7 @@ class MCIR(object):
         
         """Run main function."""
 
-        use_gpu = self.args['--gpu'] 
+        
 
         ###########################################################################
         # Parse input files
@@ -414,7 +416,7 @@ class MCIR(object):
             # Create image based on ProjData
             image = self.sinos[0].create_uniform_image(0.0, (nxny, nxny))
             # If using GPU, need to make sure that image is right size.
-            if self.args['--gpu']:
+            if self.args['--niftypet']:
                 dim = (127, 320, 320)
                 spacing = (2.03125, 2.08626, 2.08626)
             # elif non-default spacing desired
@@ -422,7 +424,7 @@ class MCIR(object):
                 dim = image.dimensions()
                 dxdy = float(self.args['--dxdy'])
                 spacing = (image.voxel_sizes()[0], dxdy, dxdy)
-            if self.args['--gpu'] or self.args['--dxdy'] is not None:
+            if self.args['--niftypet'] or self.args['--dxdy'] is not None:
                 image.initialise(dim=dim,
                                 vsize=spacing)
                 image.fill(0.0)
@@ -441,7 +443,7 @@ class MCIR(object):
             if len(self.attns) > 0:
                 resampled_attns = [0]*self.num_ms
                 # if using GPU, dimensions of attn and recon images have to match
-                ref = self.image if self.args['--gpu'] else None
+                ref = self.image if self.args['--niftypet'] else None
                 for i in range(self.num_ms):
                     # if we only have 1 attn image, then we need to resample into
                     # space of each gate. However, if we have num_ms attn images,
@@ -478,7 +480,7 @@ class MCIR(object):
             if len(self.attns) > 0:
                 resampled_attns = [0]*self.num_ms
                 # if using GPU, dimensions of attn and recon images have to match
-                ref = self.image if self.args['--gpu'] else None
+                ref = self.image if self.args['--niftypet'] else None
                 for i in range(self.num_ms):
                     # if we only have 1 attn image, then we need to resample into
                     # space of each gate. However, if we have num_ms attn images,
@@ -504,16 +506,25 @@ class MCIR(object):
         norm_file = self.args['--norm']
         verbosity = int(self.args['--verbosity'])
     
-        print ("args gpu", self.args['--gpu'])
-        if not self.args['--gpu']:
-            # acq_models = [pet.AcquisitionModelUsingRayTracingMatrix() for k in range(nsub * num_ms)]
+        
+        if self.args['--parallelproj']:
             acq_models = [pet.AcquisitionModelUsingParallelproj() for k in range(nsub * self.num_ms)]
-        else:
+        elif self.args['--niftypet']:
             acq_models = [pet.AcquisitionModelUsingNiftyPET() for k in range(nsub * self.num_ms)]
             for acq_model in acq_models:
                 acq_model.set_use_truncation(True)
                 acq_model.set_cuda_verbosity(verbosity)
-                acq_model.set_num_tangential_LORs(10)
+                
+        else:
+            acq_models = [pet.AcquisitionModelUsingRayTracingMatrix() for k in range(nsub * self.num_ms)]
+            for am in acq_models:
+                am.set_num_tangential_LORs(10)
+            
+        # apply resolution modelling
+        smoother = pet.SeparableGaussianImageFilter()
+        smoother.set_fwhms((3,2,2))
+        for am in acq_models:
+            am.set_image_data_processor(smoother)
 
         # create masks
         im_one = self.image.clone().allocate(1.)
@@ -536,8 +547,10 @@ class MCIR(object):
             if self.resampled_attns is not None: 
                 s = self.sinos[ind]
                 ra = self.resampled_attns[ind]
-                # am = pet.AcquisitionModelUsingRayTracingMatrix()
-                am = pet.AcquisitionModelUsingParallelproj()
+                if self.args['--parallelproj']:
+                    am = pet.AcquisitionModelUsingParallelproj()
+                else:
+                    am = pet.AcquisitionModelUsingRayTracingMatrix()
                 asm_attn = self.get_asm_attn(s,ra,am)
 
             # Get ASM dependent on attn and/or norm
@@ -643,7 +656,6 @@ class MCIR(object):
                         C[k * num_ms + i] = CompositionOperator(C[k * num_ms + i],
                                                                 self.resamplers[i], 
                                                                 preallocate=True)
-        
         # Define - data fit
         #        - operators norm if needed
         #        - rescale if needed
@@ -694,7 +706,16 @@ class MCIR(object):
                                                         b=(1./norm_ki)*self.sinos[i], 
                                                         eta=(1./norm_ki)*etas[i], 
                                                         mask=self.masks[k].as_array(),
-                                                        use_numba=True)      
+                                                        use_numba=True)
+        elif algo == 'fista':
+            if normalise:
+                raise error("algorithm {} and option --normaliseDataAndBlock not implemented together".format(algo))
+            else: 
+                f = []
+                for sino, eta, K in zip(self.sinos, etas, C):
+                    f.append( \
+                            OperatorCompositionFunction(SmoothKullbackLeibler(b=sino, eta=(eta+1e-5)), K) 
+                        )     
         else:
             raise error("algorithm '{}' is not implemented".format(algo))
     
@@ -715,7 +736,6 @@ class MCIR(object):
             r_nonneg = 1
             r_printing = 0
             device = 'gpu' if self.args['--gpu'] else 'cpu'
-            device = 'cpu'
             G = FGP_TV(r_alpha, r_iters, r_tolerance,
                     r_iso, r_nonneg, r_printing, device)
             if precond:
@@ -737,6 +757,11 @@ class MCIR(object):
                 # we'll let spdhg do its default implementation
                 sigma = None
                 tau = None
+            elif algo == 'fista':
+                sigma = None
+                tau = None
+                normK = None
+                F = functools.reduce( lambda x,y: x+y, fi[1:], fi[0])
             use_axpby = True
         else:
             if algo == 'pdhg':
@@ -1027,6 +1052,10 @@ class MCIR(object):
                 outp_file += "-riters" + str(r_iters)
             if self.resamplers is None:
                 outp_file += "_noMotion"
+            if self.args['--parallelproj']:
+                outp_file += "_pp"
+            if self.args['--niftypet']:
+                outp_file += "_nipet"
         # return outp_file
         self.outp_file = outp_file
         return self
@@ -1071,6 +1100,16 @@ class MCIR(object):
                     use_axpby=self.use_axpby,
                     norms=self.normK,
                     max_iteration=num_iter,         
+                    update_objective_interval=update_obj_fn_interval,
+                    log_file=self.outp_file+".log",
+                    )
+        elif algorithm == 'fista':
+            num_iter = num_epoch
+            algo = FISTA(
+                    initial=self.image,
+                    f=self.F,
+                    g=self.G,
+                    max_iteration=num_epoch,
                     update_objective_interval=update_obj_fn_interval,
                     log_file=self.outp_file+".log",
                     )
@@ -1125,6 +1164,10 @@ class MCIR(object):
     def get_from_args(self, keyword):
         return self.args[keyword]
 
+def apply_resolution_modelling(self):
+    smoother = pet.SeparableGaussianImageFilter()
+    smoother.set_fwhms((3,2,2))
+    acq_model.set_image_data_processor(smoother)
 
 
 
@@ -1256,6 +1299,11 @@ if __name__ == "__main__":
     dmcir.pre_process_rands()
     dmcir.clear_raw_data()
 
+    for el in dmcir.rands:
+        arr = el.as_array()
+        print ("Min", np.min(arr))
+
+
     ###########################################################################
     # Initialise recon image
     ###########################################################################
@@ -1276,6 +1324,11 @@ if __name__ == "__main__":
 
     dmcir.set_up_acq_models()
 
+    # # test projector
+    # x = dmcir.acq_models[0].adjoint(dmcir.sinos[0])
+    # reg.NiftiImageData(x).write('ray_adjoint_gate0.nii')
+    # exit(0)
+
     ###########################################################################
     # Set up reconstructor
     ###########################################################################
@@ -1284,7 +1337,14 @@ if __name__ == "__main__":
         dmcir.set_up_explicit_reconstructor()
     else:
         dmcir.set_up_reconstructor()
+    print (type(dmcir.F))
+    print ("dmcir.image", type(dmcir.image))
+    print( "evaluate F", dmcir.F(dmcir.image))
+    print( "evaluate F.gradient", dmcir.F.gradient(dmcir.image))
+    print( "evaluate G", dmcir.G(dmcir.image))
+    # sys.exit(0)
 
+    
     ###########################################################################
     # Get output filename
     ###########################################################################

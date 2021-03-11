@@ -5,6 +5,7 @@ alpha=5.0
 epochs=200
 transform="pet/transf_g*.nii"
 precond=""
+initial=""
 while getopts hpa:g:e:i:t: option
  do
  case "${option}"
@@ -39,7 +40,7 @@ loc_data=${work_dir}/cardiac_resp
 # loc_algo=${mcir_dir}/SIRF/examples/Python/PETMR
 loc_algo=${mcir_dir}/SIRF-Contribs/src/Python/sirf/contrib/MCIR
 
-base_result=${work_dir}/results/pdhg_cpureg
+base_result=${work_dir}/results/fista
 ##############    RUN NAME    ################
 if [ "${precond}" = "" ]; then
   is_precond="noprecond"
@@ -47,9 +48,16 @@ else
   is_precond="precond"
 fi
 
+if [ "${initial}" = "" ]; then
+  with_initial=""
+else
+  with_initial="--initial ${initial}"
+fi
+
+
 if [ ${transform} == "None" ]
 then run_name=notrans_rebin_rescaled_gamma_${gamma}_${is_precond}_alpha_${alpha}_gated_pdhg
-else run_name=new_motion_rescaled_gamma_${gamma}_${is_precond}_alpha_${alpha}_gated_pdhg
+else run_name=rebin_rescaled_gamma_${gamma}_${is_precond}_alpha_${alpha}_gated_pdhg
 fi
 loc_reco=${base_result}/${run_name}/recons
 loc_param=${base_result}/${run_name}/params
@@ -70,7 +78,7 @@ cd ${base_result}/${run_name}
 #epochs=2
 #update_interval=48      
 #####   RUN   ##### 
-update_interval=10
+update_interval=100
 save_interval=50
                        
 if [ ${transform} == "None" ]
@@ -89,6 +97,7 @@ python ${script_name}                         \
 -R "$loc_data/pet/total_background_g*.hs"     \
 -n "$loc_data/pet/NORM.n.hdr"                 \
 -a "$loc_data/pet/MU_g*.nii"                  \
+${with_initial}                               \
 -t def                                        \
 --nifti                                       \
 --alpha=${alpha}                              \
@@ -102,7 +111,7 @@ ${precond}                                    \
 else
 python ${script_name}                         \
 -o gated_pdhg                                 \
---algorithm=pdhg                              \
+--algorithm=fista                              \
 -r FGP_TV                                     \
 --outpath=$loc_reco                           \
 --param_path=$loc_param                       \
@@ -115,6 +124,7 @@ python ${script_name}                         \
 -n "$loc_data/pet/NORM.n.hdr"                 \
 -a "$loc_data/pet/MU_g*.nii"                  \
 -T "$loc_data/${transform}"                   \
+${with_initial}                               \
 -t def                                        \
 --nifti                                       \
 --alpha=${alpha}                              \
@@ -126,6 +136,8 @@ ${precond}                                    \
 --StorageSchemeMemory                         \
 --numSegsToCombine=11                         \
 --numViewsToCombine=2                         \
+--gpu \
+--parallelproj \
 --numThreads=15 
 fi
 #2>&1 > script.log
