@@ -653,7 +653,7 @@ class MCIR(object):
             # resample if needed
             if self.resamplers is not None:
                 for (k,i) in np.ndindex((nsub,self.num_ms)):
-                        C[k * num_ms + i] = CompositionOperator(C[k * num_ms + i],
+                        C[k * self.num_ms + i] = CompositionOperator(C[k * self.num_ms + i],
                                                                 self.resamplers[i], 
                                                                 preallocate=True)
         # Define - data fit
@@ -683,13 +683,13 @@ class MCIR(object):
                 
         elif algo == 'spdhg':
             # we want the norm of each component
-            normProj = get_proj_normi(BlockOperator(*C),nsub,param_path)
+            normProj = self.get_proj_normi(BlockOperator(*C),nsub,param_path)
             if normalise:
                 # define rescaled data fit
                 f_rs = [None] * (self.num_ms * nsub)
                 for (k,i) in np.ndindex((nsub,self.num_ms)):
-                    norm_ki = normProj[k * num_ms + i]
-                    f_rs[k * num_ms + i] = ScaledFunction(KullbackLeibler(
+                    norm_ki = normProj[k * self.num_ms + i]
+                    f_rs[k * self.num_ms + i] = ScaledFunction(KullbackLeibler(
                                                                     b=(1./norm_ki)*self.sinos[i], 
                                                                     eta=(1./norm_ki)*etas[i], 
                                                                     mask=self.masks[k].as_array(),
@@ -702,7 +702,7 @@ class MCIR(object):
                 # define data fit
                 f = [None] * (self.num_ms * nsub)
                 for (k,i) in np.ndindex((nsub,self.num_ms)):
-                    f[k * num_ms + i] = KullbackLeibler(
+                    f[k * self.num_ms + i] = KullbackLeibler(
                                                         b=(1./norm_ki)*self.sinos[i], 
                                                         eta=(1./norm_ki)*etas[i], 
                                                         mask=self.masks[k].as_array(),
@@ -761,7 +761,7 @@ class MCIR(object):
                 sigma = None
                 tau = None
                 normK = None
-                F = functools.reduce( lambda x,y: x+y, fi[1:], fi[0])
+                F = functools.reduce( lambda x,y: x+y, f[1:], f[0])
             use_axpby = True
         else:
             if algo == 'pdhg':
@@ -869,13 +869,13 @@ class MCIR(object):
             # resample if needed
             if self.resamplers is not None:  
                 for (k,i) in np.ndindex((nsub,self.num_ms)):
-                    C[k * num_ms + i] = CompositionOperator(C[k * num_ms + i],
+                    C[k * self.num_ms + i] = CompositionOperator(C[k * self.num_ms + i],
                                                             self.resamplers[i], 
                                                             preallocate=True)
 
         # define gradient
         Grad = GradientOperator(self.image, backend='c', correlation='SpaceChannel')
-        normGrad = get_grad_norm(Grad,param_path)
+        normGrad = self.get_grad_norm(Grad,param_path)
 
         # define regularizer
         prior = MixedL21Norm()
@@ -915,13 +915,13 @@ class MCIR(object):
                 
         elif algo == 'spdhg':
             # we want the norm of each component
-            normProj = get_proj_normi(BlockOperator(*C),nsub,param_path)
+            normProj = self.get_proj_normi(BlockOperator(*C),nsub,param_path)
             if normalise:
                 # define rescaled data fit
                 f_rs = [None] * (self.num_ms * nsub)
                 for (k,i) in np.ndindex((nsub,self.num_ms)):
-                    norm_ki = normProj[k * num_ms + i]
-                    f_rs[k * num_ms + i] = ScaledFunction(KullbackLeibler(
+                    norm_ki = normProj[k * self.num_ms + i]
+                    f_rs[k * self.num_ms + i] = ScaledFunction(KullbackLeibler(
                                                                     b=(1./norm_ki)*self.sinos[i], 
                                                                     eta=(1./norm_ki)*etas[i], 
                                                                     mask=self.masks[k].as_array(),
@@ -939,13 +939,13 @@ class MCIR(object):
                 # define data fit
                 f = [None] * (self.num_ms * nsub)
                 for (k,i) in np.ndindex((nsub,self.num_ms)):
-                    f[k * num_ms + i] = KullbackLeibler(
+                    f[k * self.num_ms + i] = KullbackLeibler(
                                                         b=(1./norm_ki)*self.sinos[i], 
                                                         eta=(1./norm_ki)*etas[i], 
                                                         mask=self.masks[k].as_array(),
                                                         use_numba=True)
                 # append prior
-                f.append(ScaledFunction(prior,r_alpha)
+                f.append(ScaledFunction(prior,r_alpha))
                 # define operator
                 C.append(Grad)
                 normK = normProj + [normGrad]
@@ -1008,6 +1008,21 @@ class MCIR(object):
             # save to file
             np.save(file_path, normK, allow_pickle=True)
         return normK
+    
+    def get_grad_norm(self, Grad,param_path):
+        param_path = str(self.args['--param_path'])
+        file_path = '{}/normGrad.npy'.format(param_path)
+        if os.path.isfile(file_path):
+            print('Norm file {} exists, load it'.format(file_path))
+            normG = float(np.load(file_path, allow_pickle=True))
+        else:
+            print('Norm file {} does not exist, compute it'.format(file_path))
+            normG = Grad.norm()
+            # save to file
+            np.save(file_path, normG, allow_pickle=True)
+        return normG
+    
+
 
     def get_output_filename(self):
         """Get output filename."""
@@ -1085,7 +1100,7 @@ class MCIR(object):
                     )
         elif algorithm == 'spdhg':
             if regularisation == 'explicit_TV':
-                num_iter = 2 * (len(K)-1) * num_epoch
+                num_iter = 2 * (len(self.K)-1) * num_epoch
             else:
                 num_iter = len(self.K) * num_epoch
             algo = SPDHG(            
