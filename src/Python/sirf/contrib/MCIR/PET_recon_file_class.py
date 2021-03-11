@@ -623,8 +623,7 @@ class MCIR(object):
         etas = self.rands if self.rands is not None else [sino * 0 + 1e-5 for sino in self.sinos]
 
         # Create composition operators containing linear
-        # acquisition models and resamplers,
-        # and create data fit functions
+        # acquisition models and resamplers
         
         if nsub == 1:
             if self.resamplers is None:
@@ -636,22 +635,80 @@ class MCIR(object):
                         am,
                         res, preallocate=True)
                         for am, res in zip(*(self.acq_models, self.resamplers))]
-            fi = [KullbackLeibler(b=sino, eta=eta, mask=self.masks[0].as_array(),use_numba=True) 
-                    for sino, eta in zip(self.sinos, etas)]
         else:
             C = [am for am in self.acq_models]
-            fi = [None] * (self.num_ms * nsub)
-            for (k,i) in np.ndindex((nsub,self.num_ms)):
-                # resample if needed
-                if self.resamplers is not None:
-                    C[k * num_ms + i] = CompositionOperator(
-                        #KTam.get_linear_acquisition_model(),
-                        C[k * num_ms + i],
-                        self.resamplers[i], preallocate=True)
-                fi[k * num_ms + i] = KullbackLeibler(b=self.sinos[i], eta=etas[i], 
-                                              mask=self.masks[k].as_array(),use_numba=True)
+            # resample if needed
+            if self.resamplers is not None:
+                for (k,i) in np.ndindex((nsub,self.num_ms)):
+                        C[k * num_ms + i] = CompositionOperator(C[k * num_ms + i],
+                                                                self.resamplers[i], 
+                                                                preallocate=True)
+        
+        # Define - data fit
+        #        - operators norm if needed
+        #        - rescale if needed
 
+        if algo == 'pdhg':
+            # If needed, compute the norm of the BlockOperator
+            if normalise or not precond:
+                normProj = self.get_proj_norm(BlockOperator(*C),param_path)
+            if normalise:
+                # define rescaled data fit
+                f_rs  = [ScaledFunction(KullbackLeibler(
+                                            b=(1./normProj)*sino, 
+                                            eta=(1./normProj)*eta, 
+                                            mask=self.masks[0].as_array(),
+                                            use_numba=True),
+                                        normProj)
+                        for sino, eta in zip(self.sinos, etas)]
+                # define rescaled operator
+                C_rs = [ScaledOperator(Ci,1/normProj) for Ci in C]
+                normProj = 1.0
+            else:
+                # define data fit
+                f = [KullbackLeibler(b=sino, eta=eta, mask=self.masks[0].as_array(),use_numba=True) 
+                    for sino, eta in zip(self.sinos, etas)]
+                
+        elif algo == 'spdhg':
+            # we want the norm of each component
+            normProj = get_proj_normi(BlockOperator(*C),nsub,param_path)
+            if normalise:
+                # define rescaled data fit
+                f_rs = [None] * (self.num_ms * nsub)
+                for (k,i) in np.ndindex((nsub,self.num_ms)):
+                    norm_ki = normProj[k * num_ms + i]
+                    f_rs[k * num_ms + i] = ScaledFunction(KullbackLeibler(
+                                                                    b=(1./norm_ki)*self.sinos[i], 
+                                                                    eta=(1./norm_ki)*etas[i], 
+                                                                    mask=self.masks[k].as_array(),
+                                                                    use_numba=True),
+                                                        norm_ki)
+                # define rescaled operator
+                C_rs = [ScaledOperator(Ci,1/normProji) for Ci, normProji in zip(C,normProj)]
+                normProj = [1.] * len(C_rs)
+            else:
+                # define data fit
+                f = [None] * (self.num_ms * nsub)
+                for (k,i) in np.ndindex((nsub,self.num_ms)):
+                    f[k * num_ms + i] = KullbackLeibler(
+                                                        b=(1./norm_ki)*self.sinos[i], 
+                                                        eta=(1./norm_ki)*etas[i], 
+                                                        mask=self.masks[k].as_array(),
+                                                        use_numba=True)      
+        else:
+            raise error("algorithm '{}' is not implemented".format(algo))
+    
+        # Define Block Operator and BlockFunction
+        if normalise:
+            K = BlockOperator(*C_rs)
+            F = BlockFunction(*f_rs)
+        else:
+            K = BlockOperator(*C)
+            F = BlockFunction(*f)
+        # Harmonize notations
+        normK = normProj
 
+        # Define prior
         if regularizer == "FGP_TV":
             r_tolerance = 1e-7
             r_iso = 0
@@ -667,30 +724,21 @@ class MCIR(object):
             G = IndicatorBox(lower=0)
         else:
             raise ValueError("Unknown regularisation. Expected FGP_TV or None, got {}".format(regularizer))
-        
-        F = BlockFunction(*fi)
-        K = BlockOperator(*C)
 
-        if algo == 'spdhg':
-            prob = [1./ len(K)] * len(K)
-        else:
-            prob = None
+        # Define probabilities
+        prob = [1./ len(K)] * len(K) if algo == 'spdhg' else None
 
+        # Define step-sizes
         if not precond:
             if algo == 'pdhg':
-                # we want the norm of the whole physical BlockOp
-                normK = self.get_proj_norm(BlockOperator(*C),param_path)
                 sigma = gamma/normK
                 tau = 1/(normK*gamma)
             elif algo == 'spdhg':
-                # we want the norm of each component
-                normK = self.get_proj_normi(BlockOperator(*C),nsub,param_path)
                 # we'll let spdhg do its default implementation
                 sigma = None
                 tau = None
             use_axpby = True
         else:
-            normK=None
             if algo == 'pdhg':
                 tau = K.adjoint(K.range_geometry().allocate(1.))
                 # CD take care of edge of the FOV
@@ -779,8 +827,7 @@ class MCIR(object):
         etas = self.rands if self.rands is not None else [sino * 0 + 1e-5 for sino in self.sinos]
 
         # Create composition operators containing linear
-        # acquisition models and resamplers,
-        # and create data fit functions
+        # acquisition models and resamplers
 
         if nsub == 1:
             if self.resamplers is None:
@@ -792,43 +839,50 @@ class MCIR(object):
                         am,
                         res, preallocate=True)
                         for am, res in zip(*(self.acq_models, self.resamplers))]
-            fi = [KullbackLeibler(b=sino, eta=eta, mask=self.masks[0].as_array(),use_numba=True) 
-                    for sino, eta in zip(self.sinos, etas)]
         else:
             C = [am for am in self.acq_models]
-            fi = [None] * (self.num_ms * nsub)
-            for (k,i) in np.ndindex((nsub,self.num_ms)):
-                # resample if needed
-                if self.resamplers is not None:            
-                    C[k * num_ms + i] = CompositionOperator(
-                        #KTam.get_linear_acquisition_model(),
-                        C[k * num_ms + i],
-                        self.resamplers[i], preallocate=True)
-                fi[k * num_ms + i] = KullbackLeibler(b=self.sinos[i], eta=etas[i], 
-                                             mask=self.masks[k].as_array(),use_numba=True)
+            # resample if needed
+            if self.resamplers is not None:  
+                for (k,i) in np.ndindex((nsub,self.num_ms)):
+                    C[k * num_ms + i] = CompositionOperator(C[k * num_ms + i],
+                                                            self.resamplers[i], 
+                                                            preallocate=True)
 
         # define gradient
         Grad = GradientOperator(self.image, backend='c', correlation='SpaceChannel')
         normGrad = get_grad_norm(Grad,param_path)
 
-        # define data fit
-        data_fit = MixedL21Norm()
+        # define regularizer
+        prior = MixedL21Norm()
         MixedL21Norm.proximal = MixedL21Norm_proximal
 
         if algo == 'pdhg':
             # we want the norm of the whole physical BlockOp
             normProj = self.get_proj_norm(BlockOperator(*C),param_path)
             if normalise:
+                # define rescaled data fit
+                f_rs  = [ScaledFunction(KullbackLeibler(
+                                            b=(1./normProj)*sino, 
+                                            eta=(1./normProj)*eta, 
+                                            mask=self.masks[0].as_array(),
+                                            use_numba=True),
+                                        normProj)
+                        for sino, eta in zip(self.sinos, etas)]
+                # append rescaled prior
+                f_rs.append(ScaledFunction(prior,r_alpha * normGrad))
+                # define rescaled operator
                 C_rs = [ScaledOperator(Ci,1/normProj) for Ci in C]
                 Grad_rs = ScaledOperator(Grad,1/normGrad)
                 C_rs.append(Grad_rs)
-                f_rs = [ScaledFunction(f,normProj) 
-                        for f in fi]
-                f_rs.append(ScaledFunction(data_fit,r_alpha * normGrad))
                 normK = np.sqrt(2)
             else:
+                # define data fit
+                f = [KullbackLeibler(b=sino, eta=eta, mask=self.masks[0].as_array(),use_numba=True) 
+                    for sino, eta in zip(self.sinos, etas)]
+                # append prior
+                f.append(ScaledFunction(prior,r_alpha))
+                # define operator
                 C.append(Grad)
-                fi.append(ScaledFunction(data_fit,r_alpha))
                 normK = np.sqrt(normProj**2 + normGrad**2)
             sigma = gamma/normK
             tau = 1/(normK*gamma)
@@ -838,17 +892,37 @@ class MCIR(object):
             # we want the norm of each component
             normProj = get_proj_normi(BlockOperator(*C),nsub,param_path)
             if normalise:
+                # define rescaled data fit
+                f_rs = [None] * (self.num_ms * nsub)
+                for (k,i) in np.ndindex((nsub,self.num_ms)):
+                    norm_ki = normProj[k * num_ms + i]
+                    f_rs[k * num_ms + i] = ScaledFunction(KullbackLeibler(
+                                                                    b=(1./norm_ki)*self.sinos[i], 
+                                                                    eta=(1./norm_ki)*etas[i], 
+                                                                    mask=self.masks[k].as_array(),
+                                                                    use_numba=True),
+                                                        norm_ki)
+                # append rescaled prior
+                f_rs.append(ScaledFunction(prior,r_alpha * normGrad))
+                # define rescaled operator
                 C_rs = [ScaledOperator(Ci,1/normProji) for Ci, normProji in zip(C,normProj)]
                 Grad_rs = ScaledOperator(Grad,1/normGrad)
                 C_rs.append(Grad_rs)
-                f_rs = [ScaledFunction(f,normProji) 
-                        for f, normProji in zip(fi, normProj)]
-                f_rs.append(ScaledFunction(data_fit,r_alpha * normGrad))
                 normK = [1.] * len(C_rs)
                 prob = [1./(2 * (len(C_rs)-1))] * (len(C_rs)-1) + [1./2]
             else:
+                # define data fit
+                f = [None] * (self.num_ms * nsub)
+                for (k,i) in np.ndindex((nsub,self.num_ms)):
+                    f[k * num_ms + i] = KullbackLeibler(
+                                                        b=(1./norm_ki)*self.sinos[i], 
+                                                        eta=(1./norm_ki)*etas[i], 
+                                                        mask=self.masks[k].as_array(),
+                                                        use_numba=True)
+                # append prior
+                f.append(ScaledFunction(prior,r_alpha)
+                # define operator
                 C.append(Grad)
-                fi.append(ScaledFunction(data_fit,r_alpha))
                 normK = normProj + [normGrad]
                 prob = [1./(2 * (len(C)-1))] * (len(C)-1) + [1./2]
             # we'll let spdhg do its default stepsize implementation
@@ -863,7 +937,7 @@ class MCIR(object):
             F = BlockFunction(*f_rs)
             K = BlockOperator(*C_rs)
         else:
-            F = BlockFunction(*fi)
+            F = BlockFunction(*f)
             K = BlockOperator(*C)
         use_axpby = False
 
