@@ -92,8 +92,8 @@ import sirf.STIR as pet
 from cil.framework import BlockDataContainer, ImageGeometry, BlockGeometry
 from cil.optimisation.algorithms import PDHG, SPDHG, FISTA
 from cil.optimisation.functions import \
-    KullbackLeibler, BlockFunction, IndicatorBox, MixedL21Norm, ScaledFunction,\
-        SmoothKullbackLeibler, OperatorCompositionFunction
+    KullbackLeibler, BlockFunction, IndicatorBox, MixedL21Norm, ScaledFunction#,\
+        #SmoothKullbackLeibler, OperatorCompositionFunction
 from cil.optimisation.operators import \
     CompositionOperator, BlockOperator, LinearOperator, GradientOperator, ScaledOperator
 from cil.plugins.ccpi_regularisation.functions import FGP_TV
@@ -234,6 +234,7 @@ class MCIR(object):
         self.trans = trans
         self.sinos_raw = sinos_raw
         self.attns = attns
+        print('Number of attns is {}'.format(len(self.attns)))
         self.rands_raw = rands_raw
         return self
 
@@ -434,31 +435,6 @@ class MCIR(object):
         return self
 
 
-    def resample_attn_images(self):
-        """Resample attenuation images if necessary."""
-        resampled_attns = None
-        if self.trans is None:
-            resampled_attns = self.attns
-        else:
-            if len(self.attns) > 0:
-                resampled_attns = [0]*self.num_ms
-                # if using GPU, dimensions of attn and recon images have to match
-                ref = self.image if self.args['--niftypet'] else None
-                for i in range(self.num_ms):
-                    # if we only have 1 attn image, then we need to resample into
-                    # space of each gate. However, if we have num_ms attn images,
-                    # then assume they are already in the correct position, so use
-                    # None as transformation.
-                    tran = self.trans[i] if len(self.attns) == 1 else None
-                    # If only 1 attn image, then resample that. If we have num_ms
-                    # attn images, then use each attn image of each frame.
-                    attn = self.attns[0] if len(self.attns) == 1 else self.attns[i]
-                    resam = self.get_resampler(attn, ref=ref, trans=tran)
-                    resampled_attns[i] = resam.forward(attn)
-        # return resampled_attns
-        self.resampled_attns = resampled_attns
-        return self
-
     def get_resampler(self, img, ref=None, trans=None):
         """Return a NiftyResample object for the specified transform and image."""
         if ref is None:
@@ -471,13 +447,16 @@ class MCIR(object):
         if trans is not None:
             resampler.add_transformation(trans)
         return resampler
+
     def resample_attn_images(self):
         """Resample attenuation images if necessary."""
-        self.resampled_attns = None
-        if self.trans is None:
-            resampled_attns = self.attns
+
+        if len(self.attns) == 0:
+            resampled_attns = None
         else:
-            if len(self.attns) > 0:
+            if self.trans is None:
+                resampled_attns = self.attns
+            else:
                 resampled_attns = [0]*self.num_ms
                 # if using GPU, dimensions of attn and recon images have to match
                 ref = self.image if self.args['--niftypet'] else None
@@ -987,11 +966,49 @@ class MCIR(object):
             normK = float(np.load(file_path, allow_pickle=True))
         else:
             print('Norm file {} does not exist, compute it'.format(file_path))
-            # normK = PowerMethod(K)[0]
-            normK = K.norm()
+            normK = self.PowerMethod(K)[0]
+            #normK = K.norm()
             # save to file
             np.save(file_path, normK, allow_pickle=True)
         return normK
+
+    def PowerMethod(self, operator, x_init=None):
+        '''Power method to calculate iteratively the Lipschitz constant
+        
+        :param operator: input operator
+        :type operator: :code:`LinearOperator`
+        :param iterations: number of iterations to run
+        :type iteration: int
+        :param x_init: starting point for the iteration in the operator domain
+        :returns: tuple with: L, list of L at each iteration, the data the iteration worked on.
+        '''
+        # From the arguments
+        iterations = int(self.args['--PowerMethod_iters'])
+
+        # Initialise random
+        if x_init is None:
+            x0 = operator.domain_geometry().allocate('random')
+        else:
+            x0 = x_init.copy()
+            
+        x1 = operator.domain_geometry().allocate()
+        y_tmp = operator.range_geometry().allocate()
+        s = []
+        # Loop
+        i = 0
+        while i < iterations:
+            operator.direct(x0,out=y_tmp)
+            operator.adjoint(y_tmp,out=x1)
+            x1norm = x1.norm()
+            if hasattr(x0, 'squared_norm'):
+                s.append( x1.dot(x0) / x0.squared_norm() )
+            else:
+                x0norm = x0.norm()
+                s.append( x1.dot(x0) / (x0norm * x0norm) ) 
+            x1.multiply((1.0/x1norm), out=x0)
+            print ("current squared norm: {}".format(s[-1]))
+            i += 1
+        return np.sqrt(s[-1]), [np.sqrt(si) for si in s], x0
 
     def get_proj_normi(self, K,nsub,param_path):
         # load or compute and save norm of each sub-operator
@@ -1217,6 +1234,7 @@ if __name__ == "__main__":
     ###########################################################################
     # Global set-up
     ###########################################################################
+    print('Set up global variables')
     args = docopt(__doc__, version=__version__)
     
     # storage scheme
@@ -1286,9 +1304,12 @@ if __name__ == "__main__":
 
     # # main()
     
+    print('Set up an instance of MCIR class')
     dmcir = MCIR()
     # this should be taken out of the MCIR class, which should be given the 
     # information it requires without being fixed to a particular docopt version
+
+    print('Modify the MCIR instance with arguments')
     dmcir.set_docopt_args(args)
     # for k,v in dmcir.args.items():
     #     print (k,v)
@@ -1303,12 +1324,14 @@ if __name__ == "__main__":
     # Parse input files
     ###########################################################################
 
+    print('Parse input files')
     dmcir.get_filenames()
 
     ###########################################################################
     # Read input
     ###########################################################################
 
+    print('Read input')
     dmcir.read_files()
     dmcir.pre_process_sinos()
     dmcir.pre_process_rands()
@@ -1323,6 +1346,7 @@ if __name__ == "__main__":
     # Initialise recon image
     ###########################################################################
 
+    print('Initialise recon image')
     dmcir.get_initial_estimate()
    
 
@@ -1330,6 +1354,7 @@ if __name__ == "__main__":
     # Resample attenuation images (if necessary)
     ###########################################################################
 
+    print('Resample attenuation images (if necessary)')
     dmcir.resample_attn_images()
     print ("resampled_attns", len (dmcir.resampled_attns))
 
@@ -1337,6 +1362,7 @@ if __name__ == "__main__":
     # Set up acquisition models (one per motion state)
     ###########################################################################
 
+    print('Set up acquisition models (one per motion state)')
     dmcir.set_up_acq_models()
 
     # # test projector
@@ -1348,14 +1374,16 @@ if __name__ == "__main__":
     # Set up reconstructor
     ###########################################################################
 
+    print('Set up reconstructor')
     if args['--reg']=='explicit_TV':
         dmcir.set_up_explicit_reconstructor()
     else:
         dmcir.set_up_reconstructor()
     print (type(dmcir.F))
     print ("dmcir.image", type(dmcir.image))
-    print( "evaluate F", dmcir.F(dmcir.image))
-    print( "evaluate F.gradient", dmcir.F.gradient(dmcir.image))
+    # XXX CD: the domain of F is AcqData not ImageData?????
+    #print( "evaluate F", dmcir.F(dmcir.image))
+    #print( "evaluate F.gradient", dmcir.F.gradient(dmcir.image))
     print( "evaluate G", dmcir.G(dmcir.image))
     # sys.exit(0)
 
@@ -1364,6 +1392,7 @@ if __name__ == "__main__":
     # Get output filename
     ###########################################################################
 
+    print('Get output filename')
     dmcir.get_output_filename()
 
     ###########################################################################
@@ -1390,6 +1419,7 @@ if __name__ == "__main__":
     # pr.enable()
     
     # cProfile.run('dmcir.algo.run(dmcir.num_iter, verbose=2, print_interval=1, callback=dmcir.save_callback)')
+    print('Run the reconstruction')
     dmcir.algo.run(dmcir.num_iter, verbose=2, print_interval=1, callback=dmcir.save_callback)
     
     # pr.disable()
