@@ -607,9 +607,6 @@ class MCIR(object):
         if not os.path.exists(param_path):
             os.makedirs(param_path)
 
-        if normalise:
-            raise ValueError('options {} and regularization={} are not yet implemented together'.format(normalise, regularizer))
-
         # We'll need an additive term (eta). If randoms are present, use them
         # Else, use a scaled down version of the sinogram
         etas = self.rands if self.rands is not None else [sino * 0 + 1e-5 for sino in self.sinos]
@@ -797,6 +794,12 @@ class MCIR(object):
             sigma *= gamma
             tau *= (1/gamma)
             use_axpby = False
+
+        # check that everything is all right
+        print(self.PowerMethod(K)[0])
+        print(normK)
+        print(tau)
+        print(sigma)
 
 
         # return [F, G, K, normK, tau, sigma, use_axpby, prob, gamma]
